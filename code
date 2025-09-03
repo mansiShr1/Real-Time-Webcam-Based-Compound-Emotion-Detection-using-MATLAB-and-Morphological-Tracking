@@ -1,0 +1,164 @@
+% Clear workspace and command window
+clear; clc;
+         %% 1. Load and Prepare Dataset
+imds = imageDatastore('archive\CK+48\', ...
+    'IncludeSubfolders', true, 'LabelSource', 'foldernames');
+            % Define emotion classes (7 emotions)
+emotions = {'Angry','Contempt','Disgust','Fear','Happy','Sad','Surprise'};
+numEmotions = numel(emotions);
+
+numImages = numel(imds.Files);
+
+%% 2. Create Multi-label Logical Matrix for Each Image
+% NOTE: For demonstration, each image gets its folder label (single label)
+% plus randomly add 0-2 extra labels to simulate multi-label (compound emotions).
+labelsMulti = false(numImages, numEmotions);
+
+for i = 1:numImages
+    % Extract folder name as the primary label for the image
+    [~, folderName] = fileparts(fileparts(imds.Files{i}));
+    idx = find(strcmpi(folderName, emotions));
+    if ~isempty(idx)
+        labelsMulti(i, idx) = true;  % Set the actual label
+
+  
+        % Randomly add extra labels (simulate compound emotion)
+        extraLabels = randperm(numEmotions, randi([0, 2]));
+        labelsMulti(i, extraLabels) = true;
+    end
+end
+
+% (Optional) Save labelsMulti variable to a .mat file for future use
+save('labelsMulti.mat', 'labelsMulti');
+
+%% 3. Set Custom Read Function for Preprocessing
+imds.ReadFcn = @(filename) preprocessWithMorphology(filename);
+
+%% 4. Manually Split Dataset into Training and Validation
+rng(1); % For reproducibility
+idxAll = randperm(numImages);
+numTrain = round(0.8 * numImages);
+idxTrain = idxAll(1:numTrain);
+idxVal = idxAll(numTrain+1:end);
+
+imdstrain = subset(imds, idxTrain);
+imdsvalid = subset(imds, idxVal);
+
+% Corresponding multi-label targets
+labelsTrain = labelsMulti(idxTrain, :);
+labelsVal = labelsMulti(idxVal, :);
+
+%% 5. Define CNN Architecture Adapted for Multi-label Classification
+% Use sigmoid activation with regressionLayer to output values between 0 and 1.
+layers = [
+    imageInputLayer([48 48 1])
+
+convolution2dLayer(3,8,'Padding','same')
+    batchNormalizationLayer
+    reluLayer
+    maxPooling2dLayer(2, 'Stride', 2)
+    
+    convolution2dLayer(3,16,'Padding','same')
+    batchNormalizationLayer
+    reluLayer
+    maxPooling2dLayer(2, 'Stride', 2)
+    
+    convolution2dLayer(3,32,'Padding','same')
+    batchNormalizationLayer
+    reluLayer
+    
+    fullyConnectedLayer(numEmotions)
+    sigmoidLayer                 % For multi-label probabilities
+    regressionLayer];            % Regression layer to train with binary targets
+
+%% 6. Define Training Options
+options = trainingOptions('adam', ...
+    'InitialLearnRate', 0.001, ...
+    'MaxEpochs', 10, ...
+    'MiniBatchSize', 64, ...
+    'Shuffle', 'every-epoch', ...
+    'Verbose', false, ...
+    'Plots', 'training-progress');
+
+%% 7. Prepare Combined Datastores with Multi-label Targets
+% Combine image datastore with labels datastore so that each mini-batch
+% contains {image, label} pairs.
+trainDS = combine(imdstrain, arrayDatastore(labelsTrain));
+valDS = combine(imdsvalid, arrayDatastore(labelsVal));
+
+%% 8. Train the Network
+convnet = trainNetwork(trainDS, layers, options);
+
+%% 9. Validation - Evaluate on Validation Set
+YPredScores = predict(convnet, valDS);  % Predicted scores for each class
+% Apply threshold of 0.5 to convert scores into binary decisions
+YPredLabels = YPredScores > 0.5;
+
+% Calculate "exact match" accuracy: all labels must match for an image to count
+exactMatches = all(YPredLabels == labelsVal, 2);
+accuracy = mean(exactMatches);
+fprintf('Validation Exact Match Accuracy: %.2f%%\n', accuracy*100);
+%% 10. Real-time Emotion Recognition with Webcam (Multi-label)
+camera = webcam(1);
+figure;
+
+while true
+    % Capture frame from webcam
+    im = snapshot(camera);
+    % Convert to grayscale and resize to 48x48
+    grayIm = rgb2gray(im);
+    grayIm = imresize(grayIm, [48 48]);
+    % Apply morphological enhancement
+    enhancedIm = applyMorphology(grayIm);
+    
+    % Prepare input for prediction (48x48x1x1)
+    dlX = reshape(single(enhancedIm), [48 48 1 1]);
+    % Predict emotion scores
+    scores = predict(convnet, dlX);
+    labelsPresent = scores > 0.5;
+    
+    % Map detected labels to emotion names
+    detectedEmotions = emotions(labelsPresent);
+    if isempty(detectedEmotions)
+        detectedEmotions = {'Neutral'};
+    end
+    labelStr = strjoin(detectedEmotions, ', ');
+% Display original and enhanced images along with predicted emotions
+    subplot(1,2,1), imshow(im), title('Original');
+    subplot(1,2,2), imshow(enhancedIm), title('Morphologically Enhanced');
+    sgtitle(['Predicted Emotions: ' labelStr]);
+    drawnow;
+end
+
+% Cleanup
+clear camera;
+
+%% --- Supporting Functions ---
+function img = preprocessWithMorphology(filename)
+    % Read image
+    img = imread(filename);
+    % Convert to grayscale if image is RGB
+    if size(img, 3) == 3
+        img = rgb2gray(img);
+    end
+    % Resize image to 48x48
+    img = imresize(img, [48 48]);
+    % Apply morphological enhancement
+    img = applyMorphology(img);
+    % Convert to single precision for network input
+    img = im2single(img);
+end
+
+function enhanced = applyMorphology(grayImg)
+    % Step 1: Contrast enhancement
+    enhanced = adapthisteq(grayImg);
+    % Step 2: Morphological filtering with a disk-shaped structuring element
+se = strel('disk', 2);
+    tophat = imtophat(enhanced, se);
+    bothat = imbothat(enhanced, se);
+    morphEnhanced = enhanced + tophat - bothat;
+    % Step 3: Morphological gradient for edge enhancement
+    gradient = imdilate(morphEnhanced, se) - imerode(morphEnhanced, se);
+    % Step 4: Final adjustment
+    enhanced = imadjust(gradient);
+end
