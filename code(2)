@@ -1,0 +1,166 @@
+% Clear workspace
+clear; clc;
+
+%% 1. Load Dataset
+imds = imageDatastore('archive\CK+48\', ...
+    'IncludeSubfolders', true, 'LabelSource', 'foldernames');
+
+emotions = {'Angry','Contempt','Disgust','Fear','Happy','Sad','Surprise'};
+numEmotions = numel(emotions);
+numImages = numel(imds.Files);
+
+%% 2. Create Multi-label Matrix
+labelsMulti = false(numImages, numEmotions);
+for i = 1:numImages
+    [~, folderName] = fileparts(fileparts(imds.Files{i}));
+    idx = find(strcmpi(folderName, emotions));
+    if ~isempty(idx)
+        labelsMulti(i, idx) = true;
+        % Random extra compound labels
+        extraCount = randi([0, 1]);
+        if extraCount > 0
+            extras = randperm(numEmotions, extraCount);
+            labelsMulti(i, extras) = true;
+        end
+    end
+end
+save('labelsMulti.mat', 'labelsMulti');
+
+%% 3. Preprocessing Function with Augmentation + Morphology
+augment = true;
+imds.ReadFcn = @(filename) preprocessWithMorphology(filename, augment);
+
+%% 4. Split Dataset
+rng(1);
+idxAll = randperm(numImages);
+numTrain = round(0.8 * numImages);
+idxTrain = idxAll(1:numTrain);
+idxVal = idxAll(numTrain+1:end);
+
+imdstrain = subset(imds, idxTrain);
+imdsvalid = subset(imds, idxVal);
+labelsTrain = labelsMulti(idxTrain, :);
+labelsVal = labelsMulti(idxVal, :);
+
+trainDS = combine(imdstrain, arrayDatastore(labelsTrain));
+valDS = combine(imdsvalid, arrayDatastore(labelsVal));
+
+%% 5. Define CNN
+layers = [
+    imageInputLayer([48 48 1], 'Name','input')
+
+    convolution2dLayer(3,16,'Padding','same','Name','conv1')
+    batchNormalizationLayer('Name','bn1')
+    reluLayer('Name','relu1')
+    maxPooling2dLayer(2, 'Stride', 2, 'Name','pool1')
+
+    convolution2dLayer(3,32,'Padding','same','Name','conv2')
+    batchNormalizationLayer('Name','bn2')
+    reluLayer('Name','relu2')
+    maxPooling2dLayer(2, 'Stride', 2, 'Name','pool2')
+
+    convolution2dLayer(3,64,'Padding','same','Name','conv3')
+    batchNormalizationLayer('Name','bn3')
+    reluLayer('Name','relu3')
+    dropoutLayer(0.3, 'Name','dropout')
+
+    fullyConnectedLayer(numEmotions, 'Name','fc')
+    sigmoidLayer('Name','sigmoid')
+    regressionLayer('Name','regression') % for multi-label
+];
+
+%% 6. Training Options
+options = trainingOptions('adam', ...
+    'InitialLearnRate', 0.0008, ...
+    'MaxEpochs', 25, ...
+    'MiniBatchSize', 64, ...
+    'Shuffle', 'every-epoch', ...
+    'Verbose', false, ...
+    'Plots', 'training-progress');
+
+%% 7. Train the Network
+net = trainNetwork(trainDS, layers, options);
+
+%% 8. Evaluate on Validation Set
+YPredScores = predict(net, valDS);
+YPredLabels = YPredScores > 0.5;
+
+exactMatches = all(YPredLabels == labelsVal, 2);
+accuracy = mean(exactMatches);
+fprintf('Validation Exact Match Accuracy: %.2f%%\n', accuracy * 100);
+
+TP = sum((YPredLabels == 1) & (labelsVal == 1), 1);
+FP = sum((YPredLabels == 1) & (labelsVal == 0), 1);
+FN = sum((YPredLabels == 0) & (labelsVal == 1), 1);
+precision = TP ./ (TP + FP + eps);
+recall = TP ./ (TP + FN + eps);
+f1 = 2 * (precision .* recall) ./ (precision + recall + eps);
+fprintf('Mean F1 Score: %.2f%%\n', mean(f1)*100);
+
+%% 9. Real-Time Emotion + Smile Measurement
+camera = webcam(1);
+figure;
+
+while ishandle(gcf)
+    frame = snapshot(camera);
+    grayIm = rgb2gray(frame);
+    grayIm = imresize(grayIm, [48 48]);
+
+    [enhancedIm, morphStats] = applyMorphology(grayIm);
+    dlX = reshape(single(enhancedIm), [48 48 1 1]);
+
+    scores = predict(net, dlX);
+    labelsPresent = scores > 0.5;
+    detectedEmotions = emotions(labelsPresent);
+
+    if isempty(detectedEmotions)
+        detectedEmotions = {'Neutral'};
+    end
+    labelStr = strjoin(detectedEmotions, ', ');
+
+    if ~isempty(morphStats)
+        smileVal = mean([morphStats.Eccentricity]);
+        areaVal = mean([morphStats.Area]);
+    else
+        smileVal = 0; areaVal = 0;
+    end
+
+    subplot(1,2,1), imshow(frame), title('Original Frame');
+    subplot(1,2,2), imshow(enhancedIm), title( ...
+        sprintf('Smile (Ecc): %.2f | Area: %.1f | Emo: %s', ...
+        smileVal, areaVal, labelStr));
+    drawnow;
+end
+clear camera;
+
+%% --- Supporting Functions ---
+function img = randomAugment(img)
+    angle = randi([-15, 15], 1);
+    img = imrotate(img, angle, 'crop');
+    shift = randi([-3, 3], 1, 2);
+    img = imtranslate(img, shift);
+end
+
+function img = preprocessWithMorphology(filename, doAugment)
+    img = imread(filename);
+    if size(img,3)==3, img = rgb2gray(img); end
+    img = imresize(img, [48 48]);
+    if doAugment
+        img = randomAugment(img);
+    end
+    [img, ~] = applyMorphology(img);
+    img = im2single(img);
+end
+
+function [enhanced, stats] = applyMorphology(grayImg)
+    enhanced = adapthisteq(grayImg);
+    se = strel('disk', 2);
+    tophat = imtophat(enhanced, se);
+    bothat = imbothat(enhanced, se);
+    morphEnhanced = enhanced + tophat - bothat;
+    gradient = imdilate(morphEnhanced, se) - imerode(morphEnhanced, se);
+    enhanced = imadjust(gradient);
+    bw = imbinarize(enhanced, 'adaptive');
+    bw = bwareafilt(bw, [20, Inf]);
+    stats = regionprops(bw, 'MajorAxisLength', 'Eccentricity', 'Area');
+end
